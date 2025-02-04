@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for backend deployment with customizable resource names
+
+Parameters:
+  # Parameter for DynamoDB table name
+  DynamoDBTableName:
+    Type: String
+    Description: Name of the DynamoDB table for storing user data
+    Default: UserData
+    AllowedPattern: ^[a-zA-Z0-9-]+$
+    ConstraintDescription: Table name can only include letters, numbers, and hyphens.
+
+  # Parameter for S3 bucket name
+  ImageBucketName:
+    Type: String
+    Description: Name of the S3 bucket for storing uploaded images
+    Default: my-image-bucket-b
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: Bucket name can only include lowercase letters, numbers, and hyphens.
+
+  # Parameter for Lambda function name
+  LambdaFunctionName:
+    Type: String
+    Description: Name of the Lambda function for the backend
+    Default: BackendLambdaFunction
+    AllowedPattern: ^[a-zA-Z0-9-]+$
+    ConstraintDescription: Lambda function name can only include letters, numbers, and hyphens.
+    
+
+  # Parameter for API Gateway name
+  ApiGatewayName:
+    Type: String
+    Description: Name of the API Gateway for the backend
+    Default: BackendAPI
+    AllowedPattern: ^[a-zA-Z0-9-]+$
+    ConstraintDescription: API Gateway name can only include letters, numbers, and hyphens.
+
+  # Parameter for S3 bucket containing Lambda code
+  LambdaCodeBucket:
+    Type: String
+    Description: Name of the S3 bucket containing the Lambda function code
+    Default: my-lambda-code-bucket
+
+  # Parameter for S3 object key of the Lambda code
+  LambdaCodeKey:
+    Type: String
+    Description: S3 object key for the Lambda function code ZIP file
+    Default: my-lambda-function.zip
+
+Resources:
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaDynamoDBS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:*
+                  - s3:*
+                Resource: "*"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # Lambda Function
+  BackendLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+      Runtime: nodejs18.x
+      Timeout: 10
+
+  # DynamoDB Table
+  UserDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref DynamoDBTableName
+      AttributeDefinitions:
+        - AttributeName: UserId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: UserId
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  # S3 Bucket for Images
+  ImageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ImageBucketName
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # API Gateway
+  BackendApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Ref ApiGatewayName
+      Description: API Gateway for backend Lambda function
+
+  # API Gateway Resource
+  ApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref BackendApiGateway
+      ParentId: !GetAtt BackendApiGateway.RootResourceId
+      PathPart: backend
+
+  # API Gateway ANY Method
+  ApiGatewayPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BackendApiGateway
+      ResourceId: !Ref ApiGatewayResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt BackendLambdaFunction.Arn
+
+  ApiGatewayGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BackendApiGateway
+      ResourceId: !Ref ApiGatewayResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt BackendLambdaFunction.Arn
+
+  # Grant API Gateway permission to invoke Lambda
+  ApiGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt BackendLambdaFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${BackendApiGateway}/*
+
+  # API Gateway Deployment
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref BackendApiGateway
+      StageName: prod
+    DependsOn:
+      - ApiGatewayPostMethod  # Ensure POST method is created before deployment
+      - ApiGatewayGetMethod   # Ensure GET method is created before deployment
+
+Outputs:
+  ApiGatewayUrl:
+    Description: URL of the API Gateway
+    Value: !Sub https://${BackendApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/backend
+  ImageBucketName:
+    Description: Name of the S3 bucket for images
+    Value: !Ref ImageBucket
+  DynamoDBTableName:
+    Description: Name of the DynamoDB table
+    Value: !Ref DynamoDBTableName
+  LambdaFunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref LambdaFunctionName

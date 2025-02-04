@@ -1,0 +1,347 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for deploying a React app to S3 and CloudFront with CodePipeline and Lambda@Edge
+
+Parameters:
+  # Parameter for the S3 bucket name
+  FrontendAppBucket:
+    Type: String
+    Description: Name of the S3 bucket to host the React app
+    Default: my-react-app-bucket
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: Bucket name can only include lowercase letters, numbers, and hyphens.
+
+  # Parameter for the CloudFront distribution comment
+  CloudFrontComment:
+    Type: String
+    Description: Comment for the CloudFront distribution
+    Default: React App CloudFront Distribution
+
+  # Parameter for the default root object (e.g., index.html)
+  DefaultRootObject:
+    Type: String
+    Description: Default root object for the CloudFront distribution
+    Default: index.html
+
+  # Parameter for enabling or disabling the CloudFront distribution
+  CloudFrontEnabled:
+    Type: String
+    Description: Enable or disable the CloudFront distribution
+    Default: true
+    AllowedValues:
+      - true
+      - false
+
+  # Parameter for GitHub repository owner
+  GitHubOwner:
+    Type: String
+    Description: Owner of the GitHub repository
+    Default: echilaka1
+
+  # Parameter for GitHub repository name
+  GitHubRepo:
+    Type: String
+    Description: Name of the GitHub repository
+    Default: cloudproject
+
+  # Parameter for GitHub branch
+  GitHubBranch:
+    Type: String
+    Description: Branch of the GitHub repository to use
+    Default: main
+
+  # Parameter for GitHub OAuth token
+  GitHubOAuthToken:
+    Type: String
+    Description: GitHub OAuth token for accessing the repository
+    NoEcho: true
+
+Resources:
+  # S3 Bucket for React App
+  FrontendS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref FrontendAppBucket
+      AccessControl: Private
+      WebsiteConfiguration:
+        IndexDocument: !Ref DefaultRootObject
+        ErrorDocument: !Ref DefaultRootObject
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # CloudFront Origin Access Identity (OAI)
+  CloudFrontOAI:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Ref CloudFrontComment
+
+  # IAM Role for Lambda@Edge
+  LambdaEdgeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - edgelambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaEdgePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # Lambda Function for Routing
+  RoutingLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: RoutingLambdaFunction
+      Handler: index.handler
+      Role: !GetAtt LambdaEdgeExecutionRole.Arn
+      Code:
+        ZipFile: |
+          export const handler = async (event) => {
+            const request = event.Records[0].cf.request;
+
+            // Redirect non-static file requests to index.html
+            if (!request.uri.includes('.')) {
+              request.uri = '/index.html';
+            }
+
+            return request;
+          };
+      Runtime: nodejs16.x
+      Timeout: 5
+      MemorySize: 128
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: !Ref CloudFrontEnabled
+        Comment: !Ref CloudFrontComment
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendS3Bucket.DomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${CloudFrontOAI}"
+        DefaultCacheBehavior:
+          ViewerProtocolPolicy: "redirect-to-https"
+          TargetOriginId: S3Origin
+          ForwardedValues:
+            QueryString: false
+          LambdaFunctionAssociations:
+            - EventType: viewer-request
+              LambdaFunctionARN: !GetAtt RoutingLambdaFunction.Version
+          DefaultRootObject: !Ref DefaultRootObject
+        DefaultCacheBehavior:
+          ViewerProtocolPolicy: "redirect-to-https"
+          TargetOriginId: S3Origin
+          ForwardedValues:
+            QueryString: false
+          LambdaFunctionAssociations:
+            - EventType: viewer-request
+              LambdaFunctionARN: !GetAtt RoutingLambdaFunction.Version
+              IncludeBody: true
+        DefaultRootObject: !Ref DefaultRootObject
+
+  # S3 Bucket Policy to allow access only from CloudFront
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendS3Bucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              CanonicalUser: !GetAtt CloudFrontOAI.S3CanonicalUserId
+            Action: "s3:GetObject"
+            Resource: !Sub "arn:aws:s3:::${FrontendS3Bucket}/*"
+
+  # IAM Role for CodeBuild
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource: !Sub "arn:aws:s3:::${FrontendS3Bucket}/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - codebuild:CreateReportGroup
+                  - codebuild:CreateReport
+                  - codebuild:UpdateReport
+                  - codebuild:BatchPutTestCases
+                Resource: "*"
+
+  # CodeBuild Project
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: ReactAppBuildProject
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:5.0
+        EnvironmentVariables:
+          - Name: S3_BUCKET
+            Value: !Ref FrontendS3Bucket
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 16
+              commands:
+                - npm install
+            build:
+              commands:
+                - npm run build
+            post_build:
+              commands:
+                - aws s3 sync build/ s3://${S3_BUCKET} --delete
+          artifacts:
+            files: '**/*'
+            discard-paths: yes
+
+  # IAM Role for CodePipeline
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:PutObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${FrontendS3Bucket}"
+                  - !Sub "arn:aws:s3:::${FrontendS3Bucket}/*"
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: !GetAtt CodeBuildProject.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # CodePipeline
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: ReactAppPipeline
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref FrontendS3Bucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: 1
+              Configuration:
+                Owner: !Ref GitHubOwner
+                Repo: !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubOAuthToken
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+        - Name: Deploy
+          Actions:
+            - Name: DeployAction
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: S3
+                Version: 1
+              Configuration:
+                BucketName: !Ref FrontendS3Bucket
+                Extract: true
+              InputArtifacts:
+                - Name: BuildOutput
+
+Outputs:
+  CloudFrontURL:
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
+    Description: URL of the frontend app hosted on CloudFront
+  S3BucketName:
+    Value: !Ref FrontendS3Bucket
+    Description: Name of the S3 bucket hosting the React app
+  CodePipelineName:
+    Value: !Ref CodePipeline
+    Description: Name of the CodePipeline
+  RoutingLambdaFunctionArn:
+    Value: !GetAtt RoutingLambdaFunction.Arn
+
+    Description: ARN of the Lambda function for routing
